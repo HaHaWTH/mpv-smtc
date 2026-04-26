@@ -689,6 +689,10 @@ private:
                 idle_ = obj_bool(obj, L"idle", idle_);
             }
 
+            if (obj.HasKey(L"ended")) {
+                ended_ = obj_bool(obj, L"ended", ended_);
+            }
+
             if (obj.HasKey(L"speed")) {
                 speed_ = obj_number(obj, L"speed", speed_);
                 if (smtc_) {
@@ -767,6 +771,10 @@ private:
 
             if (obj.HasKey(L"idle")) {
                 idle_ = obj_bool(obj, L"idle", idle_);
+            }
+
+            if (obj.HasKey(L"ended")) {
+                ended_ = obj_bool(obj, L"ended", ended_);
             }
 
             if (obj.HasKey(L"speed")) {
@@ -941,7 +949,7 @@ private:
     {
         if (!smtc_) return;
 
-        if (idle_) {
+        if (idle_ || ended_) {
             smtc_.PlaybackStatus(MediaPlaybackStatus::Stopped);
         } else if (pause_) {
             smtc_.PlaybackStatus(MediaPlaybackStatus::Paused);
@@ -1062,11 +1070,41 @@ private:
         smtc_.UpdateTimelineProperties(t);
     }
 
+    bool is_at_or_past_end() const
+    {
+        if (duration_ <= 0 || !std::isfinite(duration_) || !std::isfinite(position_)) {
+            return false;
+        }
+
+        constexpr double END_EPSILON_SECONDS = 0.35;
+        return position_ >= duration_ - END_EPSILON_SECONDS;
+    }
+
+    void play_or_restart_from_smtc()
+    {
+        bool should_restart = ended_ || is_at_or_past_end();
+
+        if (should_restart) {
+            send_command_once(L"{\"command\":[\"set_property\",\"time-pos\",0]}");
+        }
+
+        send_command_once(L"{\"command\":[\"set_property\",\"pause\",false]}");
+
+        if (should_restart) {
+            ended_ = false;
+            idle_ = false;
+            pause_ = false;
+            position_ = 0;
+            update_status();
+            update_timeline(true);
+        }
+    }
+
     void on_button(SystemMediaTransportControlsButton button)
     {
         switch (button) {
         case SystemMediaTransportControlsButton::Play:
-            send_command_once(L"{\"command\":[\"set_property\",\"pause\",false]}");
+            play_or_restart_from_smtc();
             break;
 
         case SystemMediaTransportControlsButton::Pause:
@@ -1112,6 +1150,7 @@ private:
 
     bool pause_ = true;
     bool idle_ = true;
+    bool ended_ = false;
 
     double duration_ = -1;
     double position_ = 0;
