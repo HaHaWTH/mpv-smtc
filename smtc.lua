@@ -214,6 +214,7 @@ end
 local last_track_key = nil
 local last_state_key = nil
 local last_timeline_sent = 0
+local playback_ended = false
 
 local function make_track_key(title, artist, album)
     return table.concat({
@@ -255,6 +256,7 @@ local function send_state(force)
     local key = table.concat({
         tostring(pause and true or false),
         tostring(idle and true or false),
+        tostring(playback_ended and true or false),
         tostring(speed),
         tostring(playlist_pos),
         tostring(playlist_count),
@@ -270,6 +272,7 @@ local function send_state(force)
         type = "state",
         paused = pause and true or false,
         idle = idle and true or false,
+        ended = playback_ended and true or false,
         speed = speed,
         playlist_pos = playlist_pos,
         playlist_count = playlist_count,
@@ -320,6 +323,7 @@ mp.add_periodic_timer(0.75, function()
 end)
 
 mp.register_event("file-loaded", function()
+    playback_ended = false
     last_track_key = nil
     last_state_key = nil
 
@@ -329,15 +333,19 @@ mp.register_event("file-loaded", function()
 end)
 
 mp.register_event("seek", function()
+    playback_ended = false
+    send_state(true)
     send_timeline(true)
 end)
 
 mp.register_event("playback-restart", function()
+    playback_ended = false
     send_state(true)
     send_timeline(true)
 end)
 
 mp.register_event("end-file", function()
+    playback_ended = true
     send_state(true)
     send_timeline(true)
 end)
