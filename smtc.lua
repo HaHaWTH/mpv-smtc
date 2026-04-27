@@ -7,8 +7,9 @@ local o = {
     bridge = "",
     bridge_pipe = "\\\\.\\pipe\\mpv-smtc-bridge-{pid}",
     ipc_template = "\\\\.\\pipe\\mpv-smtc-{pid}",
-}
 
+    timeline_interval = 5.0,
+}
 options.read_options(o, "smtc")
 
 local pid = utils.getpid()
@@ -126,6 +127,27 @@ local function split_artist_title(raw)
     return "", raw
 end
 
+local function is_url(path)
+    return path and path:match("^%a[%w+.-]*://")
+end
+
+local function get_local_media_path()
+    local path = mp.get_property_native("path") or ""
+    if path == "" or is_url(path) then
+        return ""
+    end
+
+    local ok, normalized = pcall(function()
+        return mp.command_native({"normalize-path", path})
+    end)
+
+    if ok and normalized and normalized ~= "" and not is_url(normalized) then
+        return normalized
+    end
+
+    return path
+end
+
 local function get_track_info()
     local meta = mp.get_property_native("metadata") or {}
     local chapter_meta = mp.get_property_native("chapter-metadata") or {}
@@ -216,11 +238,12 @@ local last_state_key = nil
 local last_timeline_sent = 0
 local playback_ended = false
 
-local function make_track_key(title, artist, album)
+local function make_track_key(title, artist, album, media_path)
     return table.concat({
         title or "",
         artist or "",
         album or "",
+        media_path or "",
     }, "\31")
 end
 
@@ -228,7 +251,8 @@ local function send_track(force)
     start_bridge()
 
     local title, artist, album = get_track_info()
-    local key = make_track_key(title, artist, album)
+    local media_path = get_local_media_path()
+    local key = make_track_key(title, artist, album, media_path)
 
     if not force and key == last_track_key then
         return
@@ -241,6 +265,7 @@ local function send_track(force)
         title = title,
         artist = artist,
         album = album,
+        media_path = media_path,
     })
 end
 
@@ -279,24 +304,31 @@ local function send_state(force)
     })
 end
 
-local function send_timeline(force)
+local function send_timeline(force, seeking)
     start_bridge()
 
     local now = mp.get_time()
+    local interval = tonumber(o.timeline_interval) or 5.0
 
-    if not force and now - last_timeline_sent < 0.75 then
+    if not force and now - last_timeline_sent < interval then
         return
     end
 
     last_timeline_sent = now
 
-    local duration = mp.get_property_number("duration", 0) or 0
-    local position = mp.get_property_number("time-pos", 0) or 0
+    local duration = mp.get_property_number("duration/full", 0)
+        or mp.get_property_number("duration", 0)
+        or 0
+
+    local position = mp.get_property_number("time-pos/full", 0)
+        or mp.get_property_number("time-pos", 0)
+        or 0
 
     send_to_bridge({
         type = "timeline",
         duration = duration,
         position = position,
+        seeking = seeking and true or false,
     })
 end
 
@@ -318,8 +350,8 @@ mp.add_timeout(0.5, function()
     send_all(true)
 end)
 
-mp.add_periodic_timer(0.75, function()
-    send_timeline(false)
+mp.add_periodic_timer(1.0, function()
+    send_timeline(false, false)
 end)
 
 mp.register_event("file-loaded", function()
@@ -335,7 +367,7 @@ end)
 mp.register_event("seek", function()
     playback_ended = false
     send_state(true)
-    send_timeline(true)
+    send_timeline(true, true)
 end)
 
 mp.register_event("playback-restart", function()
