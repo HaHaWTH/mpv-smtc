@@ -202,6 +202,36 @@ static double obj_number(JsonObject const& obj, const wchar_t* key, double fallb
     return json_number(obj.Lookup(key), fallback);
 }
 
+static bool is_existing_file(const std::wstring& path)
+{
+    if (path.empty()) {
+        return false;
+    }
+
+    DWORD attr = GetFileAttributesW(path.c_str());
+
+    return attr != INVALID_FILE_ATTRIBUTES &&
+        !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool try_copy_display_from_media_file(
+    SystemMediaTransportControlsDisplayUpdater const& updater,
+    const std::wstring& media_path
+)
+{
+    if (!is_existing_file(media_path)) {
+        return false;
+    }
+
+    try {
+        StorageFile file = StorageFile::GetFileFromPathAsync(media_path).get();
+        updater.CopyFromFileAsync(MediaPlaybackType::Music, file).get();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 class MpvSmtcBridge
 {
 public:
@@ -673,6 +703,14 @@ private:
                 }
             }
 
+            if (obj.HasKey(L"media_path")) {
+                std::wstring v = obj_string(obj, L"media_path");
+                if (v != meta_media_path_) {
+                    meta_media_path_ = v;
+                    changed = true;
+                }
+            }
+
             if (changed) {
                 update_display();
             }
@@ -754,6 +792,14 @@ private:
                 if (v != meta_album_) {
                     meta_album_ = v;
                     track_changed = true;
+                }
+            }
+
+            if (obj.HasKey(L"media_path")) {
+                std::wstring v = obj_string(obj, L"media_path");
+                if (v != meta_media_path_) {
+                    meta_media_path_ = v;
+                    changed = true;
                 }
             }
 
@@ -1003,6 +1049,7 @@ private:
         auto updater = smtc_.DisplayUpdater();
 
         updater.ClearAll();
+        try_copy_display_from_media_file(updater, meta_media_path_);
         updater.Type(MediaPlaybackType::Music);
 
         auto music = updater.MusicProperties();
@@ -1167,6 +1214,7 @@ private:
     std::wstring meta_artist_;
     std::wstring meta_album_;
     std::wstring meta_album_artist_;
+    std::wstring meta_media_path_;
 
     std::chrono::steady_clock::time_point last_timeline_update_{};
 };
