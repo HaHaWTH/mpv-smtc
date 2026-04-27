@@ -805,7 +805,7 @@ private:
                 std::wstring v = obj_string(obj, L"media_path");
                 if (v != meta_media_path_) {
                     meta_media_path_ = v;
-                    changed = true;
+                    track_changed = true;
                 }
             }
 
