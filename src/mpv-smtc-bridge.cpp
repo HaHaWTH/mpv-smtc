@@ -12,6 +12,10 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Data.Json.h>
+#include <shlobj.h>
+#include <knownfolders.h>
+#include <winrt/Windows.Storage.h>
+#include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
 #include <atomic>
@@ -35,6 +39,8 @@ using namespace winrt;
 using namespace Windows::Foundation;
 using namespace Windows::Media;
 using namespace Windows::Data::Json;
+using namespace Windows::Storage;
+using namespace Windows::Storage::Streams;
 
 static constexpr wchar_t WINDOW_CLASS_NAME[] = L"mpv_smtc_bridge_hidden_window";
 static constexpr wchar_t APP_ID[] = L"mpv.exe";
