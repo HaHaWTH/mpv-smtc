@@ -12,6 +12,10 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Data.Json.h>
+#include <shlobj.h>
+#include <knownfolders.h>
+#include <winrt/Windows.Storage.h>
+#include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
 #include <atomic>
@@ -35,6 +39,8 @@ using namespace winrt;
 using namespace Windows::Foundation;
 using namespace Windows::Media;
 using namespace Windows::Data::Json;
+using namespace Windows::Storage;
+using namespace Windows::Storage::Streams;
 
 static constexpr wchar_t WINDOW_CLASS_NAME[] = L"mpv_smtc_bridge_hidden_window";
 static constexpr wchar_t APP_ID[] = L"mpv.exe";
@@ -200,6 +206,36 @@ static double obj_number(JsonObject const& obj, const wchar_t* key, double fallb
 {
     if (!obj.HasKey(key)) return fallback;
     return json_number(obj.Lookup(key), fallback);
+}
+
+static bool is_existing_file(const std::wstring& path)
+{
+    if (path.empty()) {
+        return false;
+    }
+
+    DWORD attr = GetFileAttributesW(path.c_str());
+
+    return attr != INVALID_FILE_ATTRIBUTES &&
+        !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool try_copy_display_from_media_file(
+    SystemMediaTransportControlsDisplayUpdater const& updater,
+    const std::wstring& media_path
+)
+{
+    if (!is_existing_file(media_path)) {
+        return false;
+    }
+
+    try {
+        StorageFile file = StorageFile::GetFileFromPathAsync(media_path).get();
+        updater.CopyFromFileAsync(MediaPlaybackType::Music, file).get();
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 class MpvSmtcBridge
@@ -673,6 +709,14 @@ private:
                 }
             }
 
+            if (obj.HasKey(L"media_path")) {
+                std::wstring v = obj_string(obj, L"media_path");
+                if (v != meta_media_path_) {
+                    meta_media_path_ = v;
+                    changed = true;
+                }
+            }
+
             if (changed) {
                 update_display();
             }
@@ -753,6 +797,14 @@ private:
                 std::wstring v = obj_string(obj, L"album");
                 if (v != meta_album_) {
                     meta_album_ = v;
+                    track_changed = true;
+                }
+            }
+
+            if (obj.HasKey(L"media_path")) {
+                std::wstring v = obj_string(obj, L"media_path");
+                if (v != meta_media_path_) {
+                    meta_media_path_ = v;
                     track_changed = true;
                 }
             }
@@ -1003,6 +1055,7 @@ private:
         auto updater = smtc_.DisplayUpdater();
 
         updater.ClearAll();
+        try_copy_display_from_media_file(updater, meta_media_path_);
         updater.Type(MediaPlaybackType::Music);
 
         auto music = updater.MusicProperties();
@@ -1167,6 +1220,7 @@ private:
     std::wstring meta_artist_;
     std::wstring meta_album_;
     std::wstring meta_album_artist_;
+    std::wstring meta_media_path_;
 
     std::chrono::steady_clock::time_point last_timeline_update_{};
 };
