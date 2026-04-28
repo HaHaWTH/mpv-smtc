@@ -148,6 +148,41 @@ local function get_local_media_path()
     return path
 end
 
+local function normalize_local_path(path)
+    if not path or path == "" or is_url(path) then
+        return ""
+    end
+
+    local ok, normalized = pcall(function()
+        return mp.command_native({"normalize-path", path})
+    end)
+
+    if ok and normalized and normalized ~= "" and not is_url(normalized) then
+        return normalized
+    end
+
+    return path
+end
+
+local function get_cover_info()
+    local tracks = mp.get_property_native("track-list") or {}
+
+    local has_embedded_cover = false
+    local external_cover_path = ""
+
+    for _, t in ipairs(tracks) do
+        if t.type == "video" and t.albumart then
+            if t.external and t["external-filename"] and t["external-filename"] ~= "" then
+                external_cover_path = normalize_local_path(t["external-filename"])
+            else
+                has_embedded_cover = true
+            end
+        end
+    end
+
+    return has_embedded_cover, external_cover_path
+end
+
 local function get_track_info()
     local meta = mp.get_property_native("metadata") or {}
     local chapter_meta = mp.get_property_native("chapter-metadata") or {}
@@ -252,7 +287,11 @@ local function send_track(force)
 
     local title, artist, album = get_track_info()
     local media_path = get_local_media_path()
+    local has_embedded_cover, external_cover_path = get_cover_info()
+
     local key = make_track_key(title, artist, album, media_path)
+        .. "\31" .. tostring(has_embedded_cover)
+        .. "\31" .. (external_cover_path or "")
 
     if not force and key == last_track_key then
         return
@@ -266,6 +305,8 @@ local function send_track(force)
         artist = artist,
         album = album,
         media_path = media_path,
+        has_embedded_cover = has_embedded_cover,
+        external_cover_path = external_cover_path,
     })
 end
 
