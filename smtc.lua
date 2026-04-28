@@ -8,7 +8,7 @@ local o = {
     bridge_pipe = "\\\\.\\pipe\\mpv-smtc-bridge-{pid}",
     ipc_template = "\\\\.\\pipe\\mpv-smtc-{pid}",
 
-    timeline_interval = 1.0,
+    timeline_interval = 5.0,
 }
 options.read_options(o, "smtc")
 
