@@ -16,6 +16,7 @@
 #include <knownfolders.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.Storage.FileProperties.h>
 
 #include <algorithm>
 #include <atomic>
@@ -42,6 +43,7 @@ using namespace Windows::Media;
 using namespace Windows::Data::Json;
 using namespace Windows::Storage;
 using namespace Windows::Storage::Streams;
+using namespace Windows::Storage::FileProperties;
 
 static constexpr wchar_t WINDOW_CLASS_NAME[] = L"mpv_smtc_bridge_hidden_window";
 static constexpr wchar_t APP_ID[] = L"mpv.exe";
@@ -201,6 +203,13 @@ static bool is_existing_file(const std::wstring& path)
 
     return attr != INVALID_FILE_ATTRIBUTES &&
         !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static ThumbnailOptions thumbnail_options_or(ThumbnailOptions a, ThumbnailOptions b)
+{
+    return static_cast<ThumbnailOptions>(
+        static_cast<uint32_t>(a) | static_cast<uint32_t>(b)
+    );
 }
 
 static std::wstring quote_command_path(const std::wstring& path)
@@ -546,6 +555,37 @@ static void patch_existing_mpv_shortcut(const std::wstring& mpv_exe_path)
     }
 }
 
+static bool storage_file_has_album_art(StorageFile const& file)
+{
+    try {
+        auto options = thumbnail_options_or(
+            ThumbnailOptions::ReturnOnlyIfCached,
+            ThumbnailOptions::UseCurrentScale
+        );
+
+        StorageItemThumbnail thumb = file.GetThumbnailAsync(
+            ThumbnailMode::MusicView,
+            256,
+            options
+        ).get();
+
+        if (!thumb) {
+            return false;
+        }
+
+        bool has_art =
+            thumb.CanRead() &&
+            thumb.Size() > 0 &&
+            thumb.Type() == ThumbnailType::Image;
+
+        thumb.Close();
+
+        return has_art;
+    } catch (...) {
+        return false;
+    }
+}
+
 static bool try_copy_display_from_media_file(
     SystemMediaTransportControlsDisplayUpdater const& updater,
     const std::wstring& media_path
@@ -557,6 +597,11 @@ static bool try_copy_display_from_media_file(
 
     try {
         StorageFile file = StorageFile::GetFileFromPathAsync(media_path).get();
+
+        if (!storage_file_has_album_art(file)) {
+            return false;
+        }
+
         updater.CopyFromFileAsync(MediaPlaybackType::Music, file).get();
         return true;
     } catch (...) {
@@ -1138,6 +1183,7 @@ private:
             if (obj.HasKey(L"position")) {
                 position_ = obj_number(obj, L"position", position_);
             }
+            // TODO: process seek
 
             update_timeline(true);
             return;
