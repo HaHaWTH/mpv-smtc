@@ -1139,8 +1139,7 @@ private:
                 position_ = obj_number(obj, L"position", position_);
             }
 
-            bool seeking = obj_bool(obj, L"seeking", false);
-            update_timeline(seeking || pause_ || idle_ || ended_);
+            update_timeline(true);
             return;
         }
 
