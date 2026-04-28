@@ -29,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #pragma comment(lib, "windowsapp")
 #pragma comment(lib, "user32")
@@ -44,31 +45,13 @@ using namespace Windows::Storage::Streams;
 
 static constexpr wchar_t WINDOW_CLASS_NAME[] = L"mpv_smtc_bridge_hidden_window";
 static constexpr wchar_t APP_ID[] = L"mpv.exe";
+static constexpr wchar_t APP_DISPLAY_NAME[] = L"mpv";
+static constexpr wchar_t MPV_SHORTCUT_NAME[] = L"mpv.lnk";
 static constexpr UINT WM_MPV_PROCESS_EXITED = WM_APP + 0x233;
 static constexpr wchar_t SMTC_OWNER_MUTEX[] = L"Local\\mpv_smtc_bridge_first_owner";
 
-static void set_window_app_id(HWND hwnd)
-{
-    winrt::com_ptr<IPropertyStore> store;
-
-    HRESULT hr = SHGetPropertyStoreForWindow(
-        hwnd,
-        IID_PPV_ARGS(store.put())
-    );
-
-    if (FAILED(hr)) return;
-
-    PROPVARIANT pv;
-    PropVariantInit(&pv);
-
-    hr = InitPropVariantFromString(APP_ID, &pv);
-    if (SUCCEEDED(hr)) {
-        store->SetValue(PKEY_AppUserModel_ID, pv);
-        store->Commit();
-    }
-
-    PropVariantClear(&pv);
-}
+static void set_window_app_id(HWND hwnd, const std::wstring& mpv_exe_path);
+static void patch_existing_mpv_shortcut(const std::wstring& mpv_exe_path);
 
 static std::wstring lower_copy(std::wstring s)
 {
@@ -220,6 +203,295 @@ static bool is_existing_file(const std::wstring& path)
         !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static std::wstring quote_command_path(const std::wstring& path)
+{
+    if (path.empty()) return L"";
+    if (path.find_first_of(L" \t") == std::wstring::npos) return path;
+    return L"\"" + path + L"\"";
+}
+
+static std::wstring dirname_from_path(const std::wstring& path)
+{
+    auto pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) return L"";
+    return path.substr(0, pos);
+}
+
+static std::wstring get_current_exe_path()
+{
+    std::wstring buf(32768, L'\0');
+
+    DWORD n = GetModuleFileNameW(
+        nullptr,
+        buf.data(),
+        static_cast<DWORD>(buf.size())
+    );
+
+    if (n == 0 || n >= buf.size()) {
+        return L"";
+    }
+
+    buf.resize(n);
+    return buf;
+}
+
+static std::wstring get_process_image_path(DWORD pid)
+{
+    if (pid == 0) return L"";
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return L"";
+
+    std::wstring path(32768, L'\0');
+    DWORD size = static_cast<DWORD>(path.size());
+
+    BOOL ok = QueryFullProcessImageNameW(h, 0, path.data(), &size);
+    CloseHandle(h);
+
+    if (!ok || size == 0) {
+        return L"";
+    }
+
+    path.resize(size);
+    return path;
+}
+
+static std::wstring full_path_lower(std::wstring path)
+{
+    if (path.empty()) return L"";
+
+    std::wstring buf(32768, L'\0');
+
+    DWORD n = GetFullPathNameW(
+        path.c_str(),
+        static_cast<DWORD>(buf.size()),
+        buf.data(),
+        nullptr
+    );
+
+    if (n == 0 || n >= buf.size()) {
+        return lower_copy(path);
+    }
+
+    buf.resize(n);
+
+    for (auto& ch : buf) {
+        if (ch == L'/') ch = L'\\';
+    }
+
+    return lower_copy(buf);
+}
+
+static bool same_file_path(const std::wstring& a, const std::wstring& b)
+{
+    if (a.empty() || b.empty()) return false;
+    return full_path_lower(a) == full_path_lower(b);
+}
+
+static HRESULT set_store_string(
+    IPropertyStore* store,
+    REFPROPERTYKEY key,
+    const std::wstring& value
+)
+{
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+
+    HRESULT hr = InitPropVariantFromString(value.c_str(), &pv);
+
+    if (SUCCEEDED(hr)) {
+        hr = store->SetValue(key, pv);
+    }
+
+    PropVariantClear(&pv);
+    return hr;
+}
+
+static std::wstring get_known_folder_path(REFKNOWNFOLDERID id)
+{
+    PWSTR raw = nullptr;
+
+    HRESULT hr = SHGetKnownFolderPath(
+        id,
+        KF_FLAG_DEFAULT,
+        nullptr,
+        &raw
+    );
+
+    if (FAILED(hr) || !raw) {
+        return L"";
+    }
+
+    std::wstring result = raw;
+    CoTaskMemFree(raw);
+    return result;
+}
+
+static std::wstring get_shortcut_target(const std::wstring& shortcut_path)
+{
+    winrt::com_ptr<IShellLinkW> link;
+
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellLink,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(link.put())
+    );
+
+    if (FAILED(hr)) return L"";
+
+    winrt::com_ptr<IPersistFile> file;
+
+    hr = link->QueryInterface(IID_PPV_ARGS(file.put()));
+    if (FAILED(hr)) return L"";
+
+    hr = file->Load(shortcut_path.c_str(), STGM_READ);
+    if (FAILED(hr)) return L"";
+
+    WIN32_FIND_DATAW find_data{};
+    std::wstring target(32768, L'\0');
+
+    hr = link->GetPath(
+        target.data(),
+        static_cast<int>(target.size()),
+        &find_data,
+        0
+    );
+
+    if (FAILED(hr)) return L"";
+
+    auto end = target.find(L'\0');
+    if (end != std::wstring::npos) {
+        target.resize(end);
+    }
+
+    return target;
+}
+
+static bool set_shortcut_app_id(const std::wstring& shortcut_path)
+{
+    winrt::com_ptr<IShellLinkW> link;
+
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellLink,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(link.put())
+    );
+
+    if (FAILED(hr)) return false;
+
+    winrt::com_ptr<IPersistFile> file;
+
+    hr = link->QueryInterface(IID_PPV_ARGS(file.put()));
+    if (FAILED(hr)) return false;
+
+    hr = file->Load(shortcut_path.c_str(), STGM_READWRITE);
+    if (FAILED(hr)) return false;
+
+    winrt::com_ptr<IPropertyStore> store;
+
+    hr = link->QueryInterface(IID_PPV_ARGS(store.put()));
+    if (FAILED(hr)) return false;
+
+    hr = set_store_string(store.get(), PKEY_AppUserModel_ID, APP_ID);
+    if (FAILED(hr)) return false;
+
+    hr = store->Commit();
+    if (FAILED(hr)) return false;
+
+    hr = file->Save(shortcut_path.c_str(), TRUE);
+    return SUCCEEDED(hr);
+}
+
+static void collect_lnk_files(
+    const std::wstring& dir,
+    std::vector<std::wstring>& out,
+    int depth = 0
+)
+{
+    if (dir.empty() || depth > 5) return;
+
+    std::wstring pattern = dir + L"\\*";
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        std::wstring name = fd.cFileName;
+
+        if (name == L"." || name == L"..") {
+            continue;
+        }
+
+        std::wstring path = dir + L"\\" + name;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            collect_lnk_files(path, out, depth + 1);
+            continue;
+        }
+
+        std::wstring low = lower_copy(name);
+
+        if (low.size() >= 4 &&
+            low.compare(low.size() - 4, 4, L".lnk") == 0) {
+            out.push_back(path);
+        }
+    } while (FindNextFileW(h, &fd));
+
+    FindClose(h);
+}
+
+static void patch_existing_mpv_shortcut(const std::wstring& mpv_exe_path)
+{
+    std::vector<std::wstring> candidates;
+
+    std::wstring user_programs = get_known_folder_path(FOLDERID_Programs);
+    std::wstring common_programs = get_known_folder_path(FOLDERID_CommonPrograms);
+
+    if (!user_programs.empty()) {
+        candidates.push_back(user_programs + L"\\" + MPV_SHORTCUT_NAME);
+    }
+
+    if (!common_programs.empty()) {
+        candidates.push_back(common_programs + L"\\" + MPV_SHORTCUT_NAME);
+    }
+
+    if (!user_programs.empty()) {
+        collect_lnk_files(user_programs, candidates);
+    }
+
+    if (!common_programs.empty()) {
+        collect_lnk_files(common_programs, candidates);
+    }
+
+    for (const auto& shortcut : candidates) {
+        if (!is_existing_file(shortcut)) {
+            continue;
+        }
+
+        std::wstring target = get_shortcut_target(shortcut);
+
+        if (is_existing_file(mpv_exe_path)) {
+            if (!same_file_path(target, mpv_exe_path)) {
+                continue;
+            }
+
+            set_shortcut_app_id(shortcut);
+            return;
+        }
+
+        if (lower_copy(filename_from_path(shortcut)) == lower_copy(MPV_SHORTCUT_NAME)) {
+            set_shortcut_app_id(shortcut);
+            return;
+        }
+    }
+}
+
 static bool try_copy_display_from_media_file(
     SystemMediaTransportControlsDisplayUpdater const& updater,
     const std::wstring& media_path
@@ -236,6 +508,49 @@ static bool try_copy_display_from_media_file(
     } catch (...) {
         return false;
     }
+}
+
+static void set_window_app_id(HWND hwnd, const std::wstring& mpv_exe_path)
+{
+    winrt::com_ptr<IPropertyStore> store;
+
+    HRESULT hr = SHGetPropertyStoreForWindow(
+        hwnd,
+        IID_PPV_ARGS(store.put())
+    );
+
+    if (FAILED(hr)) return;
+
+    std::wstring target = mpv_exe_path;
+
+    if (!is_existing_file(target)) {
+        target = get_current_exe_path();
+    }
+
+    if (!target.empty()) {
+        std::wstring icon = target + L",0";
+
+        set_store_string(
+            store.get(),
+            PKEY_AppUserModel_RelaunchCommand,
+            quote_command_path(target)
+        );
+
+        set_store_string(
+            store.get(),
+            PKEY_AppUserModel_RelaunchDisplayNameResource,
+            APP_DISPLAY_NAME
+        );
+
+        set_store_string(
+            store.get(),
+            PKEY_AppUserModel_RelaunchIconResource,
+            icon
+        );
+    }
+
+    set_store_string(store.get(), PKEY_AppUserModel_ID, APP_ID);
+    store->Commit();
 }
 
 class MpvSmtcBridge
@@ -1279,6 +1594,9 @@ int wmain(int argc, wchar_t** argv)
     SetCurrentProcessExplicitAppUserModelID(APP_ID);
 
     winrt::init_apartment(winrt::apartment_type::single_threaded);
+    std::wstring mpv_exe_path = get_process_image_path(mpv_pid);
+
+    patch_existing_mpv_shortcut(mpv_exe_path);
 
     HWND hwnd = create_hidden_window();
     if (!hwnd) {
@@ -1286,7 +1604,7 @@ int wmain(int argc, wchar_t** argv)
         return 3;
     }
 
-    set_window_app_id(hwnd);
+    set_window_app_id(hwnd, mpv_exe_path);
 
     DWORD main_thread_id = GetCurrentThreadId();
 
