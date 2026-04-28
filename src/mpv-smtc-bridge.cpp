@@ -368,8 +368,62 @@ static std::wstring get_shortcut_target(const std::wstring& shortcut_path)
     return target;
 }
 
+static std::wstring get_shortcut_app_id(const std::wstring& shortcut_path)
+{
+    winrt::com_ptr<IShellLinkW> link;
+
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellLink,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(link.put())
+    );
+
+    if (FAILED(hr)) return L"";
+
+    winrt::com_ptr<IPersistFile> file;
+
+    hr = link->QueryInterface(IID_PPV_ARGS(file.put()));
+    if (FAILED(hr)) return L"";
+
+    hr = file->Load(shortcut_path.c_str(), STGM_READ);
+    if (FAILED(hr)) return L"";
+
+    winrt::com_ptr<IPropertyStore> store;
+
+    hr = link->QueryInterface(IID_PPV_ARGS(store.put()));
+    if (FAILED(hr)) return L"";
+
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+
+    hr = store->GetValue(PKEY_AppUserModel_ID, &pv);
+    if (FAILED(hr)) {
+        PropVariantClear(&pv);
+        return L"";
+    }
+
+    PWSTR raw = nullptr;
+    hr = PropVariantToStringAlloc(pv, &raw);
+
+    PropVariantClear(&pv);
+
+    if (FAILED(hr) || !raw) {
+        return L"";
+    }
+
+    std::wstring result = raw;
+    CoTaskMemFree(raw);
+
+    return result;
+}
+
 static bool set_shortcut_app_id(const std::wstring& shortcut_path)
 {
+
+    if (get_shortcut_app_id(shortcut_path) == APP_ID) {
+        return true;
+    }
     winrt::com_ptr<IShellLinkW> link;
 
     HRESULT hr = CoCreateInstance(
