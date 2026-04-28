@@ -555,54 +555,53 @@ static void patch_existing_mpv_shortcut(const std::wstring& mpv_exe_path)
     }
 }
 
-static bool storage_file_has_album_art(StorageFile const& file)
-{
-    try {
-        auto options = thumbnail_options_or(
-            ThumbnailOptions::ReturnOnlyIfCached,
-            ThumbnailOptions::UseCurrentScale
-        );
-
-        StorageItemThumbnail thumb = file.GetThumbnailAsync(
-            ThumbnailMode::MusicView,
-            256,
-            options
-        ).get();
-
-        if (!thumb) {
-            return false;
-        }
-
-        bool has_art =
-            thumb.CanRead() &&
-            thumb.Size() > 0 &&
-            thumb.Type() == ThumbnailType::Image;
-
-        thumb.Close();
-
-        return has_art;
-    } catch (...) {
-        return false;
-    }
-}
-
 static bool try_copy_display_from_media_file(
     SystemMediaTransportControlsDisplayUpdater const& updater,
-    const std::wstring& media_path
+    const std::wstring& media_path,
+    bool has_embedded_cover
 )
 {
+    if (!has_embedded_cover) {
+        return false;
+    }
+
     if (!is_existing_file(media_path)) {
         return false;
     }
 
     try {
         StorageFile file = StorageFile::GetFileFromPathAsync(media_path).get();
-
-        if (!storage_file_has_album_art(file)) {
-            return false;
-        }
-
         updater.CopyFromFileAsync(MediaPlaybackType::Music, file).get();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool try_set_thumbnail_from_image_file(
+    SystemMediaTransportControlsDisplayUpdater const& updater,
+    const std::wstring& image_path
+)
+{
+    if (!is_existing_file(image_path)) {
+        return false;
+    }
+
+    std::wstring name = lower_copy(filename_from_path(image_path));
+
+    bool supported =
+        name.ends_with(L".png") ||
+        name.ends_with(L".jpg") ||
+        name.ends_with(L".jpeg") ||
+        name.ends_with(L".bmp");
+
+    if (!supported) {
+        return false;
+    }
+
+    try {
+        StorageFile file = StorageFile::GetFileFromPathAsync(image_path).get();
+        updater.Thumbnail(RandomAccessStreamReference::CreateFromFile(file));
         return true;
     } catch (...) {
         return false;
@@ -1131,6 +1130,22 @@ private:
                 }
             }
 
+            if (obj.HasKey(L"has_embedded_cover")) {
+                bool v = obj_bool(obj, L"has_embedded_cover", false);
+                if (v != meta_has_embedded_cover_) {
+                    meta_has_embedded_cover_ = v;
+                    changed = true;
+                }
+            }
+
+            if (obj.HasKey(L"external_cover_path")) {
+                std::wstring v = obj_string(obj, L"external_cover_path");
+                if (v != meta_external_cover_path_) {
+                    meta_external_cover_path_ = v;
+                    changed = true;
+                }
+            }
+
             if (changed) {
                 update_display();
             }
@@ -1261,6 +1276,22 @@ private:
                 playlist_count_ = static_cast<int>(
                     obj_number(obj, L"playlist_count", playlist_count_)
                 );
+            }
+
+            if (obj.HasKey(L"has_embedded_cover")) {
+                bool v = obj_bool(obj, L"has_embedded_cover", false);
+                if (v != meta_has_embedded_cover_) {
+                    meta_has_embedded_cover_ = v;
+                    track_changed = true;
+                }
+            }
+
+            if (obj.HasKey(L"external_cover_path")) {
+                std::wstring v = obj_string(obj, L"external_cover_path");
+                if (v != meta_external_cover_path_) {
+                    meta_external_cover_path_ = v;
+                    track_changed = true;
+                }
             }
 
             if (track_changed) {
@@ -1470,8 +1501,18 @@ private:
         auto updater = smtc_.DisplayUpdater();
 
         updater.ClearAll();
-        try_copy_display_from_media_file(updater, meta_media_path_);
+
+        bool copied_from_media = try_copy_display_from_media_file(
+            updater,
+            meta_media_path_,
+            meta_has_embedded_cover_
+        );
+
         updater.Type(MediaPlaybackType::Music);
+
+        if (!copied_from_media && !meta_external_cover_path_.empty()) {
+            try_set_thumbnail_from_image_file(updater, meta_external_cover_path_);
+        }
 
         auto music = updater.MusicProperties();
 
@@ -1636,6 +1677,8 @@ private:
     std::wstring meta_album_;
     std::wstring meta_album_artist_;
     std::wstring meta_media_path_;
+    bool meta_has_embedded_cover_ = false;
+    std::wstring meta_external_cover_path_;
 
     std::chrono::steady_clock::time_point last_timeline_update_{};
 };
