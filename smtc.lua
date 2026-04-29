@@ -250,22 +250,70 @@ local function get_track_info()
     return title, artist, album
 end
 
+local bridge_pipe_conn = nil
+
+local function close_bridge_pipe()
+    if bridge_pipe_conn then
+        pcall(function()
+            bridge_pipe_conn:close()
+        end)
+        bridge_pipe_conn = nil
+    end
+end
+
+local function open_bridge_pipe()
+    if bridge_pipe_conn then
+        return true
+    end
+
+    local ok, pipe = pcall(io.open, bridge_pipe, "wb")
+    if not ok or not pipe then
+        return false
+    end
+
+    bridge_pipe_conn = pipe
+    return true
+end
+
+local function write_bridge_line(line)
+    if not bridge_pipe_conn then
+        return false
+    end
+
+    local ok = pcall(function()
+        bridge_pipe_conn:write(line)
+        bridge_pipe_conn:flush()
+    end)
+
+    return ok
+end
+
 local function send_to_bridge(tbl)
     tbl.pid = pid
     tbl.ipc = mpv_ipc
 
     local line = utils.format_json(tbl) .. "\n"
 
-    local ok, pipe = pcall(io.open, bridge_pipe, "w")
-    if not ok or not pipe then
+    if not open_bridge_pipe() then
         return false
     end
 
-    pcall(pipe.write, pipe, line)
-    pcall(pipe.flush, pipe)
-    pcall(pipe.close, pipe)
+    if write_bridge_line(line) then
+        return true
+    end
 
-    return true
+    close_bridge_pipe()
+
+    if not open_bridge_pipe() then
+        return false
+    end
+
+    if write_bridge_line(line) then
+        return true
+    end
+
+    close_bridge_pipe()
+    return false
 end
 
 local last_track_key = nil
@@ -297,9 +345,7 @@ local function send_track(force)
         return
     end
 
-    last_track_key = key
-
-    send_to_bridge({
+    local ok = send_to_bridge({
         type = "track",
         title = title,
         artist = artist,
@@ -308,6 +354,10 @@ local function send_track(force)
         has_embedded_cover = has_embedded_cover,
         external_cover_path = external_cover_path,
     })
+
+    if ok then
+        last_track_key = key
+    end
 end
 
 local function send_state(force)
@@ -332,9 +382,7 @@ local function send_state(force)
         return
     end
 
-    last_state_key = key
-
-    send_to_bridge({
+    local ok = send_to_bridge({
         type = "state",
         paused = pause and true or false,
         idle = idle and true or false,
@@ -343,6 +391,10 @@ local function send_state(force)
         playlist_pos = playlist_pos,
         playlist_count = playlist_count,
     })
+
+    if ok then
+        last_state_key = key
+    end
 end
 
 local function send_timeline(force, seeking)
@@ -355,8 +407,6 @@ local function send_timeline(force, seeking)
         return
     end
 
-    last_timeline_sent = now
-
     local duration = mp.get_property_number("duration/full", 0)
         or mp.get_property_number("duration", 0)
         or 0
@@ -365,12 +415,16 @@ local function send_timeline(force, seeking)
         or mp.get_property_number("time-pos", 0)
         or 0
 
-    send_to_bridge({
+    local ok = send_to_bridge({
         type = "timeline",
         duration = duration,
         position = position,
         seeking = seeking and true or false,
     })
+
+    if ok then
+        last_timeline_sent = now
+    end
 end
 
 local function send_all(force_track)
@@ -383,6 +437,8 @@ local function send_quit()
     send_to_bridge({
         type = "quit",
     })
+
+    close_bridge_pipe()
 end
 
 start_bridge()

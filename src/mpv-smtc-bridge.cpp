@@ -911,20 +911,37 @@ private:
         return true;
     }
 
-    void write_line_to_handle(HANDLE h, const std::wstring& line)
+    bool write_line_to_handle(HANDLE h, const std::wstring& line)
     {
-        if (h == INVALID_HANDLE_VALUE) return;
+        if (h == INVALID_HANDLE_VALUE) {
+            return false;
+        }
 
         std::string utf8 = winrt::to_string(line + L"\n");
-        DWORD written = 0;
 
-        WriteFile(
-            h,
-            utf8.data(),
-            static_cast<DWORD>(utf8.size()),
-            &written,
-            nullptr
-        );
+        const char* data = utf8.data();
+        DWORD total = static_cast<DWORD>(utf8.size());
+        DWORD sent = 0;
+
+        while (sent < total) {
+            DWORD written = 0;
+
+            BOOL ok = WriteFile(
+                h,
+                data + sent,
+                total - sent,
+                &written,
+                nullptr
+            );
+
+            if (!ok || written == 0) {
+                return false;
+            }
+
+            sent += written;
+        }
+
+        return true;
     }
 
     void send_observe_line(const std::wstring& line)
@@ -964,7 +981,10 @@ private:
             return;
         }
 
-        write_line_to_handle(h, line);
+        if (write_line_to_handle(h, line)) {
+            FlushFileBuffers(h);
+        }
+
         CloseHandle(h);
     }
 
