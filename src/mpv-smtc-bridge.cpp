@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cwctype>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <locale>
 #include <mutex>
@@ -701,7 +702,7 @@ public:
 
         smtc_.PlaybackPositionChangeRequested([this](auto const&, PlaybackPositionChangeRequestedEventArgs const& args) {
             double sec = timespan_to_seconds(args.RequestedPlaybackPosition());
-            send_command_once(L"{\"command\":[\"set_property\",\"time-pos\"," + number_json(sec) + L"]}");
+            send_command_once(L"{\"command\":[\"seek\"," + number_json(sec) + L",\"absolute+exact\"]}");
         });
 
         smtc_.PlaybackRateChangeRequested([this](auto const&, PlaybackRateChangeRequestedEventArgs const& args) {
@@ -1033,7 +1034,7 @@ private:
         write_line_to_handle(event_pipe_, line);
     }
 
-    void send_command_once(const std::wstring& line)
+    void send_commands_once(std::initializer_list<std::wstring> lines)
     {
         std::lock_guard<std::mutex> lock(command_mutex_);
 
@@ -1065,11 +1066,25 @@ private:
             return;
         }
 
-        if (write_line_to_handle(h, line)) {
+        bool ok = true;
+
+        for (auto const& line : lines) {
+            if (!write_line_to_handle(h, line)) {
+                ok = false;
+                break;
+            }
+        }
+
+        if (ok) {
             FlushFileBuffers(h);
         }
 
         CloseHandle(h);
+    }
+
+    void send_command_once(const std::wstring& line)
+    {
+        send_commands_once({ line });
     }
 
     void observe(int id, const wchar_t* property)
@@ -1719,20 +1734,24 @@ private:
     {
         bool should_restart = ended_ || is_at_or_past_end();
 
-        if (should_restart) {
-            send_command_once(L"{\"command\":[\"set_property\",\"time-pos\",0]}");
-        }
-
-        send_command_once(L"{\"command\":[\"set_property\",\"pause\",false]}");
+        idle_ = false;
+        pause_ = false;
 
         if (should_restart) {
             ended_ = false;
-            idle_ = false;
-            pause_ = false;
             position_ = 0;
             update_status();
             update_timeline(true);
+
+            send_commands_once({
+                L"{\"command\":[\"seek\",0,\"absolute+exact\"]}",
+                L"{\"command\":[\"set_property\",\"pause\",false]}"
+            });
+            return;
         }
+
+        update_status();
+        send_command_once(L"{\"command\":[\"set_property\",\"pause\",false]}");
     }
 
     void on_button(SystemMediaTransportControlsButton button)

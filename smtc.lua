@@ -319,7 +319,7 @@ end
 local last_track_key = nil
 local last_state_key = nil
 local last_timeline_sent = 0
-local playback_ended = false
+local playback_ended = mp.get_property_native("eof-reached") and true or false
 
 local function make_track_key(title, artist, album, media_path)
     return table.concat({
@@ -473,8 +473,8 @@ mp.register_event("playback-restart", function()
     send_timeline(true)
 end)
 
-mp.register_event("end-file", function()
-    playback_ended = true
+mp.register_event("end-file", function(event)
+    playback_ended = event and event.reason == "eof" or false
     send_state(true)
     send_timeline(true)
 end)
@@ -487,6 +487,12 @@ end)
 
 mp.observe_property("idle-active", "native", function()
     send_state(false)
+end)
+
+mp.observe_property("eof-reached", "native", function(_, value)
+    playback_ended = value and true or false
+    send_state(true)
+    send_timeline(true)
 end)
 
 mp.observe_property("speed", "native", function()
