@@ -792,11 +792,7 @@ public:
                 }
 
                 read_loop();
-
-                if (event_pipe_ != INVALID_HANDLE_VALUE) {
-                    CloseHandle(event_pipe_);
-                    event_pipe_ = INVALID_HANDLE_VALUE;
-                }
+                close_event_pipe();
             }
         });
     }
@@ -805,10 +801,8 @@ public:
     {
         alive_ = false;
 
-        if (event_pipe_ != INVALID_HANDLE_VALUE) {
-            CancelIoEx(event_pipe_, nullptr);
-            CloseHandle(event_pipe_);
-            event_pipe_ = INVALID_HANDLE_VALUE;
+        if (stop_event_) {
+            SetEvent(stop_event_);
         }
 
         if (worker_.joinable()) {
@@ -819,6 +813,8 @@ public:
             watchdog_.join();
         }
 
+        close_event_pipe();
+
         if (owner_mutex_) {
             if (owns_smtc_) {
                 ReleaseMutex(owner_mutex_);
@@ -827,6 +823,11 @@ public:
             CloseHandle(owner_mutex_);
             owner_mutex_ = nullptr;
             owns_smtc_ = false;
+        }
+
+        if (stop_event_) {
+            CloseHandle(stop_event_);
+            stop_event_ = nullptr;
         }
     }
 
@@ -879,13 +880,59 @@ private:
         return false;
     }
 
+    void close_event_pipe()
+    {
+        if (event_pipe_ != INVALID_HANDLE_VALUE) {
+            DisconnectNamedPipe(event_pipe_);
+            CloseHandle(event_pipe_);
+            event_pipe_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    bool wait_pipe_io(HANDLE h, OVERLAPPED& ov, DWORD* transferred)
+    {
+        DWORD dummy = 0;
+        if (!transferred) {
+            transferred = &dummy;
+        }
+
+        HANDLE waits[2] = {
+            ov.hEvent,
+            stop_event_
+        };
+
+        DWORD count = stop_event_ ? 2 : 1;
+
+        DWORD wr = WaitForMultipleObjects(
+            count,
+            waits,
+            FALSE,
+            INFINITE
+        );
+
+        if (wr == WAIT_OBJECT_0) {
+            return GetOverlappedResult(h, &ov, transferred, FALSE) != FALSE;
+        }
+
+        if (count == 2 && wr == WAIT_OBJECT_0 + 1) {
+            CancelIoEx(h, &ov);
+            GetOverlappedResult(h, &ov, transferred, TRUE);
+            SetLastError(ERROR_OPERATION_ABORTED);
+            return false;
+        }
+
+        return false;
+    }
+
     bool connect_event_pipe()
     {
+        close_event_pipe();
+
         event_pipe_ = CreateNamedPipeW(
             bridge_pipe_name_.c_str(),
-            PIPE_ACCESS_INBOUND,
+            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
+            1,
             65536,
             65536,
             0,
@@ -893,22 +940,59 @@ private:
         );
 
         if (event_pipe_ == INVALID_HANDLE_VALUE) {
-            Sleep(500);
+            if (alive_) {
+                Sleep(200);
+            }
             return false;
         }
 
-        BOOL ok = ConnectNamedPipe(event_pipe_, nullptr)
-            ? TRUE
-            : (GetLastError() == ERROR_PIPE_CONNECTED);
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-        if (!ok) {
-            CloseHandle(event_pipe_);
-            event_pipe_ = INVALID_HANDLE_VALUE;
-            Sleep(500);
+        if (!ov.hEvent) {
+            close_event_pipe();
+            if (alive_) {
+                Sleep(200);
+            }
             return false;
         }
 
-        return true;
+        BOOL ok = ConnectNamedPipe(event_pipe_, &ov);
+
+        if (ok) {
+            CloseHandle(ov.hEvent);
+            return true;
+        }
+
+        DWORD err = GetLastError();
+
+        if (err == ERROR_PIPE_CONNECTED) {
+            CloseHandle(ov.hEvent);
+            return true;
+        }
+
+        if (err == ERROR_IO_PENDING) {
+            DWORD ignored = 0;
+            bool connected = wait_pipe_io(event_pipe_, ov, &ignored);
+
+            CloseHandle(ov.hEvent);
+
+            if (connected && alive_) {
+                return true;
+            }
+
+            close_event_pipe();
+            return false;
+        }
+
+        CloseHandle(ov.hEvent);
+        close_event_pipe();
+
+        if (alive_) {
+            Sleep(200);
+        }
+
+        return false;
     }
 
     bool write_line_to_handle(HANDLE h, const std::wstring& line)
@@ -1046,15 +1130,37 @@ private:
         char chunk[8192];
 
         while (alive_) {
+            OVERLAPPED ov{};
+            ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+            if (!ov.hEvent) {
+                break;
+            }
+
             DWORD read = 0;
 
             BOOL ok = ReadFile(
                 event_pipe_,
                 chunk,
                 static_cast<DWORD>(sizeof(chunk)),
-                &read,
-                nullptr
+                nullptr,
+                &ov
             );
+
+            if (!ok) {
+                DWORD err = GetLastError();
+
+                if (err == ERROR_IO_PENDING) {
+                    ok = wait_pipe_io(event_pipe_, ov, &read) ? TRUE : FALSE;
+                } else {
+                    CloseHandle(ov.hEvent);
+                    break;
+                }
+            } else {
+                ok = GetOverlappedResult(event_pipe_, &ov, &read, FALSE);
+            }
+
+            CloseHandle(ov.hEvent);
 
             if (!ok || read == 0) {
                 break;
@@ -1671,6 +1777,8 @@ private:
     DWORD main_thread_id_ = 0;
 
     HANDLE event_pipe_ = INVALID_HANDLE_VALUE;
+    HANDLE stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
     std::mutex command_mutex_;
     std::thread worker_;
     std::atomic<bool> alive_{ true };
@@ -1791,6 +1899,7 @@ int wmain(int argc, wchar_t** argv)
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_MPV_PROCESS_EXITED) {
             bridge.shutdown_smtc();
+            bridge.stop();
             PostQuitMessage(0);
             continue;
         }
