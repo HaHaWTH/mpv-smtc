@@ -50,7 +50,7 @@ static constexpr wchar_t WINDOW_CLASS_NAME[] = L"mpv_smtc_bridge_hidden_window";
 static constexpr wchar_t APP_ID[] = L"mpv.exe";
 static constexpr wchar_t APP_DISPLAY_NAME[] = L"mpv";
 static constexpr wchar_t MPV_SHORTCUT_NAME[] = L"mpv.lnk";
-static constexpr UINT WM_MPV_PROCESS_EXITED = WM_APP + 0x233;
+static constexpr UINT WM_MPV_PROCESS_EXITED = WM_APP + 0x947;
 static constexpr wchar_t SMTC_OWNER_MUTEX[] = L"Local\\mpv_smtc_bridge_first_owner";
 
 static void set_window_app_id(HWND hwnd, const std::wstring& mpv_exe_path);
