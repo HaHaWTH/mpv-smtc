@@ -740,7 +740,7 @@ public:
 
     void ensure_smtc_visible()
     {
-        if (!smtc_ || smtc_visible_ || shutting_down_) {
+        if (!can_update_smtc()|| smtc_visible_) {
             return;
         }
 
@@ -1306,8 +1306,16 @@ public:
 
         std::wstring type = obj_string(obj, L"type");
 
+        if (shutting_down_) {
+            if (type == L"quit") {
+                PostThreadMessageW(main_thread_id_, WM_BRIDGE_GRACEFUL_QUIT, 0, 0);
+            }
+            return;
+        }
+
         if (!owns_smtc_) {
             if (type == L"quit") {
+                shutting_down_ = true;
                 PostThreadMessageW(main_thread_id_, WM_BRIDGE_GRACEFUL_QUIT, 0, 0);
             }
 
@@ -1399,7 +1407,7 @@ public:
 
             if (obj.HasKey(L"speed")) {
                 speed_ = obj_number(obj, L"speed", speed_);
-                if (smtc_) {
+                if (can_update_smtc()) {
                     smtc_.PlaybackRate(speed_);
                 }
             }
@@ -1492,7 +1500,7 @@ public:
 
             if (obj.HasKey(L"speed")) {
                 speed_ = obj_number(obj, L"speed", speed_);
-                if (smtc_) {
+                if (can_update_smtc()) {
                     smtc_.PlaybackRate(speed_);
                 }
             }
@@ -1540,6 +1548,7 @@ public:
 
     void handle_property(int id, IJsonValue const& data)
     {
+        if (shutting_down_) return;
         bool display_dirty = false;
         bool status_dirty = false;
         bool timeline_dirty = false;
@@ -1598,7 +1607,7 @@ public:
 
         case PROP_SPEED:
             speed_ = json_number(data, 1.0);
-            if (smtc_) smtc_.PlaybackRate(speed_);
+            if (can_update_smtc()) smtc_.PlaybackRate(speed_);
             break;
 
         default:
@@ -1676,9 +1685,14 @@ public:
         return L"";
     }
 
+    bool can_update_smtc() const
+    {
+        return smtc_ && !shutting_down_;
+    }
+
     void update_status()
     {
-        if (!smtc_) return;
+        if (!can_update_smtc()) return;
 
         if (idle_ || ended_) {
             smtc_.PlaybackStatus(MediaPlaybackStatus::Stopped);
@@ -1691,7 +1705,7 @@ public:
 
     void update_button_state()
     {
-        if (!smtc_) return;
+        if (!can_update_smtc()) return;
 
         bool has_playlist = playlist_count_ > 1;
 
@@ -1701,7 +1715,7 @@ public:
 
     void update_display()
     {
-        if (!smtc_) return;
+        if (!can_update_smtc()) return;
 
         std::wstring title = trim_copy(meta_title_);
         std::wstring artist = trim_copy(best_artist());
@@ -1772,7 +1786,7 @@ public:
 
     void update_timeline(bool force)
     {
-        if (!smtc_) return;
+        if (!can_update_smtc()) return;
 
         auto now = std::chrono::steady_clock::now();
 
@@ -2023,7 +2037,7 @@ int wmain(int argc, wchar_t** argv)
             std::unique_ptr<std::string> line(
                 reinterpret_cast<std::string*>(msg.lParam));
 
-            if (line) {
+            if (!quit_requested && line) {
                 bridge.handle_json_line_on_owner_thread(*line);
             }
 
@@ -2037,7 +2051,7 @@ int wmain(int argc, wchar_t** argv)
                 quit_requested = true;
 
                 bridge.shutdown_smtc();
-                SetTimer(hwnd, BRIDGE_QUIT_TIMER_ID, 350, nullptr);
+                SetTimer(hwnd, BRIDGE_QUIT_TIMER_ID, 1000, nullptr);
             }
 
             continue;
