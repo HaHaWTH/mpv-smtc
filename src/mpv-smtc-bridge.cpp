@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <memory>
 
 #pragma comment(lib, "windowsapp")
 #pragma comment(lib, "user32")
@@ -52,6 +53,9 @@ static constexpr wchar_t APP_DISPLAY_NAME[] = L"mpv";
 static constexpr wchar_t MPV_SHORTCUT_NAME[] = L"mpv.lnk";
 static constexpr UINT WM_MPV_PROCESS_EXITED = WM_APP + 0x947;
 static constexpr wchar_t SMTC_OWNER_MUTEX[] = L"Local\\mpv_smtc_bridge_first_owner";
+static constexpr UINT WM_BRIDGE_JSON_LINE = WM_APP + 0x168;
+static constexpr UINT WM_BRIDGE_GRACEFUL_QUIT = WM_APP + 0x214;
+static constexpr UINT_PTR BRIDGE_QUIT_TIMER_ID = 0x2499;
 
 static void set_window_app_id(HWND hwnd, const std::wstring& mpv_exe_path);
 static void patch_existing_mpv_shortcut(const std::wstring& mpv_exe_path);
@@ -676,6 +680,10 @@ public:
     void init_smtc(HWND hwnd)
     {
         hwnd_ = hwnd;
+        shutting_down_ = false;
+        smtc_visible_ = false;
+        got_track_ = false;
+
         auto interop = winrt::get_activation_factory<
             SystemMediaTransportControls,
             ::ISystemMediaTransportControlsInterop>();
@@ -685,35 +693,62 @@ public:
             &::ISystemMediaTransportControlsInterop::GetForWindow,
             hwnd);
 
-        smtc_.IsEnabled(true);
+        smtc_.IsEnabled(false);
+
         smtc_.IsPlayEnabled(true);
         smtc_.IsPauseEnabled(true);
         smtc_.IsStopEnabled(true);
-        smtc_.IsNextEnabled(true);
-        smtc_.IsPreviousEnabled(true);
+        smtc_.IsNextEnabled(false);
+        smtc_.IsPreviousEnabled(false);
         smtc_.IsFastForwardEnabled(true);
         smtc_.IsRewindEnabled(true);
         smtc_.PlaybackRate(1.0);
         smtc_.PlaybackStatus(MediaPlaybackStatus::Stopped);
 
-        smtc_.ButtonPressed([this](auto const&, SystemMediaTransportControlsButtonPressedEventArgs const& args) {
-            on_button(args.Button());
-        });
+        button_token_ = smtc_.ButtonPressed(
+            [this](auto const&, SystemMediaTransportControlsButtonPressedEventArgs const& args) {
+                if (!alive_ || shutting_down_) return;
+                on_button(args.Button());
+            });
 
-        smtc_.PlaybackPositionChangeRequested([this](auto const&, PlaybackPositionChangeRequestedEventArgs const& args) {
-            double sec = timespan_to_seconds(args.RequestedPlaybackPosition());
-            send_command_once(L"{\"command\":[\"seek\"," + number_json(sec) + L",\"absolute+exact\"]}");
-        });
+        position_token_ = smtc_.PlaybackPositionChangeRequested(
+            [this](auto const&, PlaybackPositionChangeRequestedEventArgs const& args) {
+                if (!alive_ || shutting_down_) return;
 
-        smtc_.PlaybackRateChangeRequested([this](auto const&, PlaybackRateChangeRequestedEventArgs const& args) {
-            double rate = args.RequestedPlaybackRate();
-            if (rate >= 0.25 && rate <= 4.0) {
-                send_command_once(L"{\"command\":[\"set_property\",\"speed\"," + number_json(rate) + L"]}");
-            }
-        }); 
+                double sec = timespan_to_seconds(args.RequestedPlaybackPosition());
+                send_command_once(
+                    L"{\"command\":[\"seek\"," +
+                    number_json(sec) +
+                    L",\"absolute+exact\"]}");
+            });
 
-        update_display();
-        update_timeline(true);
+        rate_token_ = smtc_.PlaybackRateChangeRequested(
+            [this](auto const&, PlaybackRateChangeRequestedEventArgs const& args) {
+                if (!alive_ || shutting_down_) return;
+
+                double rate = args.RequestedPlaybackRate();
+                if (rate >= 0.25 && rate <= 4.0) {
+                    send_command_once(
+                        L"{\"command\":[\"set_property\",\"speed\"," +
+                        number_json(rate) +
+                        L"]}");
+                }
+            });
+
+        smtc_handlers_registered_ = true;
+    }
+
+    void ensure_smtc_visible()
+    {
+        if (!smtc_ || smtc_visible_ || shutting_down_) {
+            return;
+        }
+
+        try {
+            smtc_.IsEnabled(true);
+            smtc_visible_ = true;
+        } catch (...) {
+        }
     }
 
     bool acquire_smtc_ownership()
@@ -740,19 +775,67 @@ public:
         return true;
     }
 
-    void shutdown_smtc()
+    void revoke_smtc_events() noexcept
     {
-        idle_ = true;
-        pause_ = true;
-        position_ = 0;
-        duration_ = 0;
-
-        if (smtc_) {
-            smtc_.PlaybackStatus(MediaPlaybackStatus::Stopped);
-            smtc_.IsEnabled(false);
+        if (!smtc_ || !smtc_handlers_registered_) {
+            return;
         }
 
-        update_timeline(true);
+        try {
+            smtc_.ButtonPressed(button_token_);
+            smtc_.PlaybackPositionChangeRequested(position_token_);
+            smtc_.PlaybackRateChangeRequested(rate_token_);
+        } catch (...) {
+        }
+
+        smtc_handlers_registered_ = false;
+    }
+
+    void shutdown_smtc()
+    {
+        if (shutting_down_) {
+            return;
+        }
+
+        shutting_down_ = true;
+
+        idle_ = true;
+        pause_ = true;
+        ended_ = true;
+        position_ = 0;
+        duration_ = 0;
+        speed_ = 1.0;
+
+        revoke_smtc_events();
+
+        if (!smtc_) {
+            return;
+        }
+
+        try {
+            smtc_.IsPlayEnabled(false);
+            smtc_.IsPauseEnabled(false);
+            smtc_.IsStopEnabled(false);
+            smtc_.IsNextEnabled(false);
+            smtc_.IsPreviousEnabled(false);
+            smtc_.IsFastForwardEnabled(false);
+            smtc_.IsRewindEnabled(false);
+
+            smtc_.PlaybackRate(1.0);
+            smtc_.PlaybackStatus(MediaPlaybackStatus::Stopped);
+
+            SystemMediaTransportControlsTimelineProperties t;
+            t.StartTime(seconds_to_timespan(0));
+            t.MinSeekTime(seconds_to_timespan(0));
+            t.Position(seconds_to_timespan(0));
+            t.MaxSeekTime(seconds_to_timespan(0));
+            t.EndTime(seconds_to_timespan(0));
+            smtc_.UpdateTimelineProperties(t);
+
+            smtc_.IsEnabled(false);
+            smtc_visible_ = false;
+        } catch (...) {
+        }
     }
 
     void start_watchdog()
@@ -801,6 +884,8 @@ public:
     void stop()
     {
         alive_ = false;
+
+        revoke_smtc_events();
 
         if (stop_event_) {
             SetEvent(stop_event_);
@@ -1195,13 +1280,22 @@ private:
                 }
 
                 if (!line.empty()) {
-                    handle_json_line(line);
+                    auto* payload = new std::string(std::move(line));
+
+                    if (!PostThreadMessageW(
+                        main_thread_id_,
+                        WM_BRIDGE_JSON_LINE,
+                        0,
+                        reinterpret_cast<LPARAM>(payload))) {
+                        delete payload;
+                    }
                 }
             }
         }
     }
 
-    void handle_json_line(const std::string& line)
+public:
+    void handle_json_line_on_owner_thread(const std::string& line)
     {
         JsonObject obj{ nullptr };
 
@@ -1214,25 +1308,15 @@ private:
 
         if (!owns_smtc_) {
             if (type == L"quit") {
-                PostThreadMessageW(main_thread_id_, WM_QUIT, 0, 0);
+                PostThreadMessageW(main_thread_id_, WM_BRIDGE_GRACEFUL_QUIT, 0, 0);
             }
 
             return;
         }
 
         if (type == L"quit") {
-            idle_ = true;
-            pause_ = true;
-            position_ = 0;
-            duration_ = 0;
-
-            if (smtc_) {
-                smtc_.PlaybackStatus(MediaPlaybackStatus::Stopped);
-                smtc_.IsEnabled(false);
-            }
-
-            update_timeline(true);
-            PostThreadMessageW(main_thread_id_, WM_QUIT, 0, 0);
+            shutdown_smtc();
+            PostThreadMessageW(main_thread_id_, WM_BRIDGE_GRACEFUL_QUIT, 0, 0);
             return;
         }
 
@@ -1290,6 +1374,12 @@ private:
             if (changed) {
                 update_display();
             }
+
+            got_track_ = true;
+            update_button_state();
+            update_status();
+            update_timeline(true);
+            ensure_smtc_visible();
 
             return;
         }
@@ -1437,11 +1527,13 @@ private:
 
             if (track_changed) {
                 update_display();
+                got_track_ = true;
             }
 
             update_button_state();
             update_status();
             update_timeline(true);
+            ensure_smtc_visible();
             return;
         }
     }
@@ -1828,6 +1920,15 @@ private:
     std::wstring meta_external_cover_path_;
 
     std::chrono::steady_clock::time_point last_timeline_update_{};
+
+    winrt::event_token button_token_{};
+    winrt::event_token position_token_{};
+    winrt::event_token rate_token_{};
+
+    bool smtc_handlers_registered_ = false;
+    bool smtc_visible_ = false;
+    bool got_track_ = false;
+    bool shutting_down_ = false;
 };
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1914,10 +2015,38 @@ int wmain(int argc, wchar_t** argv)
     bridge.start();
     bridge.start_watchdog();
 
+    bool quit_requested = false;
+
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_MPV_PROCESS_EXITED) {
-            bridge.shutdown_smtc();
+        if (msg.message == WM_BRIDGE_JSON_LINE) {
+            std::unique_ptr<std::string> line(
+                reinterpret_cast<std::string*>(msg.lParam));
+
+            if (line) {
+                bridge.handle_json_line_on_owner_thread(*line);
+            }
+
+            continue;
+        }
+
+        if (msg.message == WM_MPV_PROCESS_EXITED ||
+            msg.message == WM_BRIDGE_GRACEFUL_QUIT) {
+
+            if (!quit_requested) {
+                quit_requested = true;
+
+                bridge.shutdown_smtc();
+                SetTimer(hwnd, BRIDGE_QUIT_TIMER_ID, 350, nullptr);
+            }
+
+            continue;
+        }
+
+        if (msg.message == WM_TIMER &&
+            msg.wParam == BRIDGE_QUIT_TIMER_ID) {
+
+            KillTimer(hwnd, BRIDGE_QUIT_TIMER_ID);
             bridge.stop();
             PostQuitMessage(0);
             continue;
